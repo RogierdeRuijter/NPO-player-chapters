@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NPO Player: Chapters</title>
+</head>
+
+<body>
+  <main>
+    <div id="player-container"
+      style="aspect-ratio: 16/9; position: relative; min-width: 60ch; width: 70vw; max-width: 85ch; margin: 0 auto;">
+      <video></video>
+    </div>
+
+    <section id="chapters">
+      <h2>Chapters</h2>
+      <ol id="chapter-list"></ol>
+    </section>
+  </main>
+
+  <script src="https://cdn.npoplayer.nl/player/v2/npoplayer.js"></script>
+  <script src="https://cdn.npoplayer.nl/player/v2/npoplayer-video-ui.js"></script>
+
+  <script type="module">
+    import {SignJWT} from "https://esm.sh/jose@6.2.17";
+
+    const {NpoVideoPlayer} = window.NpoPlayer;
+    const {NpoVideoPlayerUIFactory} = window.NpoVideoPlayerUIFactory;
+
+    const getSecret = () => {
+      const secret = localStorage.getItem("npo-player-key");
+
+      return secret;
+    };
+
+    const signJWT = (mid, key, issuedAt = Math.floor(Date.now() / 1000)) =>
+      new SignJWT({iat: issuedAt})
+        .setProtectedHeader({alg: "HS256", typ: "JWT"})
+        .setSubject(mid)
+        .setIssuer("vpro")
+        .sign(key);
+
+    const timeBoundActions = [
+      {
+        id: 'marker-1',
+        type: "marker",
+        markerType: "segment",
+        startTime: 200,
+        endTime: 600,
+        label: 'Dit is een lange naam voor een hoofdstuk.'
+      },
+      {
+        id: 'marker-2',
+        type: "marker",
+        markerType: "segment",
+        startTime: 600,
+        endTime: 1200,
+        label: 'Chapter 1'
+      },
+      {
+        id: 'marker-3',
+        type: "marker",
+        markerType: "segment",
+        startTime: 1200,
+        endTime: 1800,
+        label: 'Chapter 2'
+      }
+    ];
+
+    const formatTime = (seconds) => {
+      const h = Math.floor(seconds / 3600);
+      const m = String(Math.floor((seconds % 3600) / 60)).padStart(2, '0');
+      const s = String(Math.floor(seconds % 60)).padStart(2, '0');
+      return h > 0 ? `${h}:${m}:${s}` : `${m}:${s}`;
+    };
+
+    // Resolves once an element matching the selector exists inside root.
+    const waitForElement = (root, selector) => new Promise((resolve) => {
+      const found = root.querySelector(selector);
+      if (found) {
+        resolve(found);
+        return;
+      }
+      const observer = new MutationObserver(() => {
+        const element = root.querySelector(selector);
+        if (element) {
+          observer.disconnect();
+          resolve(element);
+        }
+      });
+      observer.observe(root, {childList: true, subtree: true});
+    });
+
+    const waitForDuration = (player) => new Promise((resolve) => {
+      const duration = player.getDuration();
+      if (Number.isFinite(duration) && duration > 0) {
+        resolve(duration);
+        return;
+      }
+      player.getMediaElement().addEventListener('loadedmetadata', () => resolve(player.getDuration()), {once: true});
+    });
+
+    const MAX_LABEL_LENGTH = 20;
+
+    // Caps a label at MAX_LABEL_LENGTH characters, ellipsis included.
+    const truncateLabel = (label) => {
+      const characters = Array.from(label);
+      return characters.length > MAX_LABEL_LENGTH
+        ? `${characters.slice(0, MAX_LABEL_LENGTH - 1).join('').trimEnd()}…`
+        : label;
+    };
+
+    const findChapterAt = (chapters, time) =>
+      chapters.findLast((c) => time >= c.startTime && time < c.endTime);
+
+    function renderChapterList(chapters, player) {
+      const list = document.getElementById('chapter-list');
+      list.innerHTML = '';
+      for (const chapter of chapters) {
+        const item = document.createElement('li');
+        const button = document.createElement('button');
+        button.textContent = `${formatTime(chapter.startTime)} — ${truncateLabel(chapter.label)}`;
+        button.title = chapter.label;
+        button.addEventListener('click', () => {
+          player.seek(chapter.startTime);
+          player.play();
+        });
+        item.appendChild(button);
+        list.appendChild(item);
+      }
+    }
+
+    // The NPO UI does not draw marker actions itself, so we draw them into its seek bar.
+    async function renderChaptersInPlayer(chapters, duration, container) {
+      // The track only: .npoplayer-seekbar also contains the current/total time labels.
+      const seekBar = await waitForElement(container, '.npoplayer-seekbar-container');
+
+      // Break the track at every chapter in and out point by masking gaps out of it.
+      // The track paints its own background, so move that into a layer we can mask without masking the dot.
+      if (getComputedStyle(seekBar).position === 'static') {
+        seekBar.style.position = 'relative';
+      }
+      const background = document.createElement('div');
+      background.className = 'chapter-track-background';
+      background.style.backgroundColor = getComputedStyle(seekBar).backgroundColor;
+      seekBar.style.backgroundColor = 'transparent';
+      seekBar.prepend(background);
+
+      const boundaries = [...new Set(chapters.flatMap((c) => [c.startTime, c.endTime]))]
+        .filter((time) => time > 0 && time < duration)
+        .sort((a, b) => a - b);
+      const stops = boundaries.map((time) => {
+        const at = `${(time / duration) * 100}%`;
+        return `black calc(${at} - var(--chapter-gap) / 2), transparent 0 calc(${at} + var(--chapter-gap) / 2), black 0`;
+      });
+      seekBar.style.setProperty('--chapter-mask', `linear-gradient(to right, black 0, ${stops.join(', ')}${stops.length ? '' : ', black 100%'})`);
+
+      // The buffer and fill are narrower than the track, so size the mask to the track width to keep the gaps aligned.
+      new ResizeObserver(([entry]) => {
+        seekBar.style.setProperty('--chapter-track-width', `${entry.contentRect.width}px`);
+      }).observe(seekBar);
+
+      // Chapter title in the hover tooltip of the seek bar.
+      waitForElement(container, '.npoplayer-seekbar-thumbnail-time').then((thumbnailTime) => {
+        const tooltipTitle = document.createElement('span');
+        tooltipTitle.className = 'chapter-tooltip-title';
+        thumbnailTime.after(tooltipTitle);
+        seekBar.addEventListener('pointermove', (event) => {
+          const rect = seekBar.getBoundingClientRect();
+          const fraction = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
+          const chapter = findChapterAt(chapters, fraction * duration);
+          tooltipTitle.textContent = chapter ? truncateLabel(chapter.label) : '';
+        });
+      });
+    }
+
+    const token = await signJWT("VPWON_1351929", new TextEncoder().encode(getSecret()));
+
+    const container = document.getElementById('player-container');
+    const player = new NpoVideoPlayer({
+      options: {
+        autoplay: false,
+        disableAds: true,
+      },
+      npoTag: {
+        initprops: {
+          brand: 'your-brand',
+          brand_id: 0,
+          platform: 'web',
+          platform_version: '1.0.0',
+        },
+      },
+      uiFactory: new NpoVideoPlayerUIFactory(),
+    }, container);
+
+    await player.load(token, {
+      startOffset: 200,
+      timeBoundActions,
+    });
+
+    const chapters = timeBoundActions
+      .filter((action) => action.type === 'marker')
+      .sort((a, b) => a.startTime - b.startTime);
+    renderChapterList(chapters, player);
+
+    const duration = await waitForDuration(player);
+    renderChaptersInPlayer(chapters, duration, container);
+  </script>
+
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      margin: 0;
+      padding: 2rem;
+    }
+
+    #chapters {
+      min-width: 60ch;
+      width: 70vw;
+      max-width: 85ch;
+      margin: 0 auto;
+    }
+
+    .npoplayer-seekbar-container {
+      --chapter-gap: 4px;
+    }
+
+    .chapter-track-background {
+      position: absolute;
+      inset: 0;
+      border-radius: inherit;
+      pointer-events: none;
+    }
+
+    .chapter-track-background,
+    .npoplayer-seekbar-progress-buffer,
+    .npoplayer-seekbar-progress-fill {
+      mask-image: var(--chapter-mask, none);
+      mask-size: var(--chapter-track-width, 100%) 100%;
+      mask-position: 0 0;
+      mask-repeat: no-repeat;
+    }
+
+    .chapter-tooltip-title:not(:empty) {
+      text-box: trim-start cap alphabetic;
+    }
+
+    #chapter-list button {
+      background: none;
+      border: none;
+      padding: 0.25rem 0;
+      font: inherit;
+      color: #1a5fb4;
+      cursor: pointer;
+    }
+
+    #chapter-list button:hover {
+      text-decoration: underline;
+    }
+  </style>
+
+</body>
+
+</html>
